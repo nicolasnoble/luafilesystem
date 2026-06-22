@@ -35,6 +35,7 @@
 #ifdef _WIN32
 
 #include <direct.h>
+#include <malloc.h>
 #include <windows.h>
 #include <io.h>
 #include <sys/locking.h>
@@ -192,7 +193,12 @@ static time_t windowsToUnixTime(FILETIME ft)
 static int lfs_win32_lstat(const char *path, STAT_STRUCT * buffer)
 {
   WIN32_FILE_ATTRIBUTE_DATA win32buffer;
-  if (GetFileAttributesEx(path, GetFileExInfoStandard, &win32buffer)) {
+  int needed = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+  if (needed <= 0) return 1;
+  LPWSTR str = (LPWSTR)_malloca(needed * sizeof(wchar_t));
+  MultiByteToWideChar(CP_UTF8, 0, path, -1, str, needed);
+  if (GetFileAttributesExW(str, GetFileExInfoStandard, &win32buffer)) {
+    _freea(str);
     if (!(win32buffer.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
       return STAT_FUNC(path, buffer);
     }
@@ -209,6 +215,7 @@ static int lfs_win32_lstat(const char *path, STAT_STRUCT * buffer)
     buffer->st_size = 0;
     return 0;
   } else {
+    _freea(str);
     return 1;
   }
 }
@@ -408,7 +415,7 @@ static int lfs_lock_dir(lua_State * L)
   char *ln;
   const char *lockfile = "/lockfile.lfs";
   const char *path = luaL_checklstring(L, 1, &pathl);
-  ln = (char *) malloc(pathl + strlen(lockfile) + 1);
+  ln = (char *)_malloca(pathl + strlen(lockfile) + 1);
   if (!ln) {
     lua_pushnil(L);
     lua_pushstring(L, strerror(errno));
@@ -416,9 +423,19 @@ static int lfs_lock_dir(lua_State * L)
   }
   strcpy(ln, path);
   strcat(ln, lockfile);
-  fd = CreateFile(ln, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
-  free(ln);
+  int needed = MultiByteToWideChar(CP_UTF8, 0, ln, -1, NULL, 0);
+  if (needed <= 0) {
+      _freea(ln);
+      lua_pushnil(L);
+      lua_pushstring(L, "MultiByteToWideChar failed");
+      return 2;
+  }
+  LPWSTR str = (LPWSTR)_malloca(needed * sizeof(wchar_t));
+  MultiByteToWideChar(CP_UTF8, 0, ln, -1, str, needed);
+  fd = CreateFileW(str, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+  _freea(str);
+  _freea(ln);
   if (fd == INVALID_HANDLE_VALUE) {
     return lfs_win32_pusherror(L);
   }
@@ -584,8 +601,27 @@ static int make_link(lua_State * L)
     return 2;
   }
 
-  int result = symbolic ? CreateSymbolicLink(newpath, oldpath, is_dir)
-      : CreateHardLink(newpath, oldpath, NULL);
+  int needed = MultiByteToWideChar(CP_UTF8, 0, oldpath, -1, NULL, 0);
+  if (needed <= 0) {
+	lua_pushnil(L);
+	lua_pushstring(L, "MultiByteToWideChar failed");
+	return 2;
+  }
+  LPWSTR strold = (LPWSTR)_malloca(needed * sizeof(wchar_t));
+  MultiByteToWideChar(CP_UTF8, 0, oldpath, -1, strold, needed);
+  needed = MultiByteToWideChar(CP_UTF8, 0, newpath, -1, NULL, 0);
+  if (needed <= 0) {
+	_freea(strold);
+	lua_pushnil(L);
+	lua_pushstring(L, "MultiByteToWideChar failed");
+	return 2;
+  }
+  LPWSTR strnew = (LPWSTR)_malloca(needed * sizeof(wchar_t));
+  MultiByteToWideChar(CP_UTF8, 0, newpath, -1, strnew, needed);
+  int result = symbolic ? CreateSymbolicLinkW(strnew, strold, is_dir)
+      : CreateHardLinkW(strnew, strold, NULL);
+  _freea(strold);
+  _freea(strnew);
 
   if (result) {
     return pushresult(L, result, NULL);
@@ -1054,9 +1090,15 @@ static int push_link_target(lua_State * L)
 {
   const char *file = luaL_checkstring(L, 1);
 #ifdef _WIN32
-  HANDLE h = CreateFile(file, GENERIC_READ,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  int needed = MultiByteToWideChar(CP_UTF8, 0, file, -1, NULL, 0);
+  if (needed <= 0) return 0;
+  LPWSTR wfile = (LPWSTR)_malloca(needed * sizeof(wchar_t));
+  MultiByteToWideChar(CP_UTF8, 0, file, -1, wfile, needed);
+
+  HANDLE h = CreateFileW(wfile, GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
   if (h == INVALID_HANDLE_VALUE) {
     return lfs_win32_pusherror(L);
   }
@@ -1071,7 +1113,20 @@ static int push_link_target(lua_State * L)
     }
     target = target2;
 #ifdef _WIN32
-    tsize = (int)GetFinalPathNameByHandle(h, target, size, FILE_NAME_OPENED);
+	wchar_t* targetw = (wchar_t*)_malloca(size * sizeof(wchar_t));
+    tsize = (int)GetFinalPathNameByHandleW(h, targetw, size, FILE_NAME_OPENED);
+	int needed = WideCharToMultiByte(CP_UTF8, 0, targetw, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0) {
+      _freea(targetw);
+      break;
+    }
+	if (needed > size) {
+      _freea(targetw);
+	  size = needed;
+	  continue;
+	}
+    WideCharToMultiByte(CP_UTF8, 0, targetw, -1, target, needed, NULL, NULL);
+    _freea(targetw);
 #else
     tsize = (int)readlink(file, target, size);
 #endif
